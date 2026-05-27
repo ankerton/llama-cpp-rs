@@ -195,4 +195,46 @@ impl LlamaContext<'_> {
         let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
         unsafe { llama_cpp_sys_2::llama_memory_seq_pos_max(mem, seq_id) }
     }
+
+    /// Returns the smallest position present in the KV cache for the specified sequence,
+    /// or [`None`] when the sequence is empty (the underlying FFI returns `-1` in that case).
+    ///
+    /// # Parameters
+    ///
+    /// * `seq_id` - The sequence id to query
+    ///
+    /// # Why this matters
+    ///
+    /// Prompt-cache reuse algorithms (see llama.cpp's `tools/server`) need to verify
+    /// that a slot's KV cache **actually** contains the tokens the caller believes
+    /// it does before attempting a delta-decode at a non-zero position. If the
+    /// caller's bookkeeping says "N tokens cached" but `memory_seq_pos_min` returns
+    /// `None`, the bookkeeping is stale (the cache was emptied — e.g. by SWA
+    /// eviction or a prior failed decode) and the caller MUST fall back to a
+    /// fresh prefill instead of decoding into a phantom cache.
+    #[must_use]
+    pub fn memory_seq_pos_min(&self, seq_id: i32) -> Option<i32> {
+        let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
+        if mem.is_null() {
+            return None;
+        }
+        let pos = unsafe { llama_cpp_sys_2::llama_memory_seq_pos_min(mem, seq_id) };
+        if pos < 0 { None } else { Some(pos) }
+    }
+
+    /// Returns whether the model's memory architecture supports position-shift
+    /// operations (`kv_cache_seq_add`-style). Returns `false` for sliding-window
+    /// attention, recurrent, and hybrid memory models — on those, attempting a
+    /// position shift on previously-decoded tokens silently produces inconsistent
+    /// state. Callers gating prompt-cache reuse on this check (per llama.cpp's
+    /// `tools/server` algorithm) must disable any cache-reuse path that depends
+    /// on shifting when this returns `false`.
+    #[must_use]
+    pub fn memory_can_shift(&self) -> bool {
+        let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
+        if mem.is_null() {
+            return false;
+        }
+        unsafe { llama_cpp_sys_2::llama_memory_can_shift(mem) }
+    }
 }
