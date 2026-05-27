@@ -492,32 +492,41 @@ impl LlamaContext<'_> {
 
     /// Copy the state of a single sequence into the specified buffer with optional flags.
     ///
-    /// This is the extended version that supports flags for partial state operations.
+    /// This is the extended version that supports flags for partial state
+    /// operations. The C-side function is told the buffer's actual length
+    /// (via `dest.len()`), so writes are bounded — passing a buffer smaller
+    /// than the actual state size will cause the function to return less
+    /// than the full state, rather than overrun.
     ///
     /// # Parameters
     ///
-    /// * `dest` - Destination buffer to copy state into.
+    /// * `dest` - Destination buffer to copy state into. `dest.len()` is
+    ///   passed to the C function as the maximum write bound.
     /// * `seq_id` - The sequence ID to get the state for.
     /// * `flags` - Optional flags (e.g., [`LlamaStateSeqFlags::PARTIAL_ONLY`]).
     ///
-    /// # Safety
-    ///
-    /// Destination needs to have allocated enough memory.
-    ///
     /// # Returns
     ///
-    /// The number of bytes copied.
-    pub unsafe fn state_seq_get_data_ext(
+    /// The number of bytes actually copied. Always `<= dest.len()`.
+    ///
+    /// # Sizing
+    ///
+    /// Use [`Self::state_seq_get_size_ext`] to query the required size
+    /// before allocating. Pass a buffer of at least that size; the returned
+    /// byte count tells you how much was actually written.
+    pub fn state_seq_get_data_ext(
         &self,
-        dest: *mut u8,
+        dest: &mut [u8],
         seq_id: i32,
         flags: LlamaStateSeqFlags,
     ) -> usize {
+        // SAFETY: dest.as_mut_ptr() is valid for dest.len() bytes; the C
+        // function is bounded by the length argument we pass.
         unsafe {
             llama_cpp_sys_2::llama_state_seq_get_data_ext(
                 self.context.as_ptr(),
-                dest,
-                usize::MAX,
+                dest.as_mut_ptr(),
+                dest.len(),
                 seq_id,
                 flags.0,
             )
