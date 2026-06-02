@@ -232,44 +232,77 @@ fn main() {
     debug_log!("OUT_DIR: {}", out_dir.display());
     debug_log!("BUILD_SHARED: {}", build_shared_libs);
 
-    // ankerton patch — soften an upstream `// REVIEW`-marked assertion
-    // in llama-grammar.cpp that calls `abort()` mid-generation when the
-    // grammar's parse stacks drain. Upstream knows it's suspect (the
-    // comment ships verbatim on master) but hasn't fixed it. Crashing
-    // the whole worker because one client's JSON-schema state got stuck
-    // is worse than letting the grammar fall through. The replacement
-    // returns "no candidates rejected" — effectively grammar-off from
-    // that point on — and the request completes with partial-conformant
-    // output. Idempotent: if the target text isn't present (already
-    // patched, or upstream changed), we emit a cargo warning so we
-    // notice silently-skipped patches.
+    // ankerton patch — soften four upstream death paths in
+    // llama-grammar.cpp that kill the whole worker when one client's
+    // grammar parse stacks drain mid-generation. Upstream marks the
+    // first as `// REVIEW` (they know it's suspect); the throws + the
+    // EOG abort have the same effect — `abort()` via uncaught
+    // std::runtime_error or GGML_ABORT.
+    //
+    // All four are replaced with graceful early-returns. From that
+    // point on the grammar becomes a no-op for the request (any token
+    // is allowed; the parse state never advances); the request
+    // completes with partial-conformant output. Worker stays up.
+    //
+    // Idempotent: if NO replace target is found AND the marker isn't
+    // present, we warn — protects against silent miss after an
+    // upstream rename.
     {
         let grammar_path = llama_src.join("src/llama-grammar.cpp");
         if grammar_path.exists() {
-            let target =
-                "GGML_ASSERT(!stacks.empty()); // REVIEW";
-            let replacement = "if (stacks.empty()) { \
-                return {}; /* ANKERTON_PATCH: avoid GGML_ASSERT abort \
-                when grammar stacks drain mid-generation; was REVIEW */ }";
+            // Four patches, applied in declared order. Each is
+            // (target, replacement, label).
+            let patches: &[(&str, &str, &str)] = &[
+                (
+                    "GGML_ASSERT(!stacks.empty()); // REVIEW",
+                    "if (stacks.empty()) { return {}; /* ANKERTON_PATCH: \
+                     reject_candidates — avoid abort when stacks drain */ }",
+                    "reject_candidates:940",
+                ),
+                (
+                    "GGML_ABORT(\"fatal error\");\n    }\n\n    llama_grammar_accept_token(grammar, token, piece);",
+                    "/* ANKERTON_PATCH: accept — was GGML_ABORT for EOG-with-non-empty-stack; \
+                     return so worker stays up */ return;\n    }\n\n    llama_grammar_accept_token(grammar, token, piece);",
+                    "accept:1435",
+                ),
+                (
+                    "if (grammar.stacks.empty()) {\n        throw std::runtime_error(\"Unexpected empty grammar stack after accepting piece: \" + piece);\n    }",
+                    "if (grammar.stacks.empty()) { /* ANKERTON_PATCH: accept_str — silent return \
+                     instead of throwing through FFI */ return; }",
+                    "accept_str:1451",
+                ),
+                (
+                    "if (grammar.stacks.empty()) {\n        throw std::runtime_error(\"Unexpected empty grammar stack after accepting piece: \" + piece + \" (\" + std::to_string(token) + \")\");\n    }",
+                    "if (grammar.stacks.empty()) { /* ANKERTON_PATCH: accept_token — silent return \
+                     instead of throwing through FFI */ return; }",
+                    "accept_token:1506",
+                ),
+            ];
             match std::fs::read_to_string(&grammar_path) {
-                Ok(content) => {
-                    if content.contains(target) {
-                        let patched = content.replace(target, replacement);
-                        if let Err(e) = std::fs::write(&grammar_path, patched) {
+                Ok(mut content) => {
+                    let mut applied = 0usize;
+                    for (target, replacement, label) in patches {
+                        if content.contains(target) {
+                            content = content.replace(target, replacement);
+                            applied += 1;
                             println!(
-                                "cargo:warning=ankerton: failed to write grammar patch: {e}"
-                            );
-                        } else {
-                            println!(
-                                "cargo:warning=ankerton: patched llama-grammar.cpp:940 \
-                                 (stacks-empty assertion → graceful return)"
+                                "cargo:warning=ankerton: patched llama-grammar.cpp {label}"
                             );
                         }
-                    } else if !content.contains("ANKERTON_PATCH") {
+                    }
+                    if applied > 0 {
+                        if let Err(e) = std::fs::write(&grammar_path, content) {
+                            println!(
+                                "cargo:warning=ankerton: failed to write grammar patches: {e}"
+                            );
+                        }
+                    } else if !std::fs::read_to_string(&grammar_path)
+                        .map(|c| c.contains("ANKERTON_PATCH"))
+                        .unwrap_or(false)
+                    {
                         println!(
-                            "cargo:warning=ankerton: llama-grammar.cpp patch target NOT FOUND \
-                             and PATCH MARKER absent — upstream may have changed; \
-                             verify before shipping a release"
+                            "cargo:warning=ankerton: NO grammar patches applied AND no marker \
+                             present — upstream likely changed; investigate"
                         );
                     }
                 }
