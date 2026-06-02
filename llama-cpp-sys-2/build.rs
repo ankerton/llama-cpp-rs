@@ -418,6 +418,54 @@ fn main() {
     debug_log!("OUT_DIR: {}", out_dir.display());
     debug_log!("BUILD_SHARED: {}", build_shared_libs);
 
+    // ankerton patch — soften an upstream `// REVIEW`-marked assertion
+    // in llama-grammar.cpp that calls `abort()` mid-generation when the
+    // grammar's parse stacks drain. Upstream knows it's suspect (the
+    // comment ships verbatim on master) but hasn't fixed it. Crashing
+    // the whole worker because one client's JSON-schema state got stuck
+    // is worse than letting the grammar fall through. The replacement
+    // returns "no candidates rejected" — effectively grammar-off from
+    // that point on — and the request completes with partial-conformant
+    // output. Idempotent: if the target text isn't present (already
+    // patched, or upstream changed), we emit a cargo warning so we
+    // notice silently-skipped patches.
+    {
+        let grammar_path = llama_src.join("src/llama-grammar.cpp");
+        if grammar_path.exists() {
+            let target =
+                "GGML_ASSERT(!stacks.empty()); // REVIEW";
+            let replacement = "if (stacks.empty()) { \
+                return {}; /* ANKERTON_PATCH: avoid GGML_ASSERT abort \
+                when grammar stacks drain mid-generation; was REVIEW */ }";
+            match std::fs::read_to_string(&grammar_path) {
+                Ok(content) => {
+                    if content.contains(target) {
+                        let patched = content.replace(target, replacement);
+                        if let Err(e) = std::fs::write(&grammar_path, patched) {
+                            println!(
+                                "cargo:warning=ankerton: failed to write grammar patch: {e}"
+                            );
+                        } else {
+                            println!(
+                                "cargo:warning=ankerton: patched llama-grammar.cpp:940 \
+                                 (stacks-empty assertion → graceful return)"
+                            );
+                        }
+                    } else if !content.contains("ANKERTON_PATCH") {
+                        println!(
+                            "cargo:warning=ankerton: llama-grammar.cpp patch target NOT FOUND \
+                             and PATCH MARKER absent — upstream may have changed; \
+                             verify before shipping a release"
+                        );
+                    }
+                }
+                Err(e) => println!(
+                    "cargo:warning=ankerton: failed to read grammar source for patching: {e}"
+                ),
+            }
+        }
+    }
+
     // Make sure that changes to the llama.cpp project trigger a rebuild.
     let rebuild_on_children_of = [
         llama_src.join("src"),
