@@ -471,9 +471,7 @@ fn main() {
                         if content.contains(target) {
                             content = content.replace(target, replacement);
                             applied += 1;
-                            println!(
-                                "cargo:warning=ankerton: patched llama-grammar.cpp {label}"
-                            );
+                            println!("cargo:warning=ankerton: patched llama-grammar.cpp {label}");
                         }
                     }
                     if applied > 0 {
@@ -1214,6 +1212,12 @@ fn main() {
             }
         }
 
+        // llama.cpp ≥ 2026-09 (ggml-org/llama.cpp#28xxx): mtmd-helper.cpp calls
+        // hash_sha256_hex(), defined in vendor/hash/hash.cpp — outside the
+        // tools/mtmd glob above, so the `mtmd` feature failed to link with
+        // "undefined symbol: hash_sha256_hex" (also seen on upstream #1121).
+        mtmd_build.include(llama_src.join("vendor"));
+        mtmd_build.file(llama_src.join("vendor/hash/hash.cpp"));
         mtmd_build.compile("mtmd");
     }
 

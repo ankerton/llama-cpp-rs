@@ -305,7 +305,11 @@ impl LlamaContext<'_> {
             return None;
         }
         let pos = unsafe { llama_cpp_sys_2::llama_memory_seq_pos_min(mem, seq_id) };
-        if pos < 0 { None } else { Some(pos) }
+        if pos < 0 {
+            None
+        } else {
+            Some(pos)
+        }
     }
 
     /// Returns whether the model's memory architecture supports position-shift
