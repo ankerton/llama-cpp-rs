@@ -1212,12 +1212,30 @@ fn main() {
             }
         }
 
-        // llama.cpp ≥ 2026-09 (ggml-org/llama.cpp#28xxx): mtmd-helper.cpp calls
-        // hash_sha256_hex(), defined in vendor/hash/hash.cpp — outside the
-        // tools/mtmd glob above, so the `mtmd` feature failed to link with
-        // "undefined symbol: hash_sha256_hex" (also seen on upstream #1121).
+        // llama.cpp ≥ 2026-09: mtmd-helper.cpp calls hash_sha256_hex(), defined
+        // under vendor/hash/ — outside the tools/mtmd glob above, so the `mtmd`
+        // feature failed to link ("undefined symbol: hash_sha256_hex", also seen
+        // on upstream #1121).
         mtmd_build.include(llama_src.join("vendor"));
+        // vendor/hash: hash.cpp (C++) plus the C implementation it calls
+        // (sha256/sha256.c). The C source must NOT go through this C++ build
+        // (it does not compile as C++), so it gets its own C cc::Build below;
+        // hash_sha256_hex() → sha256_hash() links across the two because
+        // hash.cpp wraps the header in extern "C".
         mtmd_build.file(llama_src.join("vendor/hash/hash.cpp"));
+        let mut vendor_hash_build = cc::Build::new();
+        vendor_hash_build
+            .cpp(false)
+            .include(llama_src.join("vendor"))
+            .include(llama_src.join("vendor/hash"))
+            .pic(true)
+            .warnings(false);
+        // Only what hash.cpp actually references (sha256), plus xxhash which is
+        // plain C. sha1/sha1.c is C++ inside a .c file (`namespace` at line 28)
+        // and is unreferenced by hash.cpp, so it is deliberately left out.
+        vendor_hash_build.file(llama_src.join("vendor/hash/sha256/sha256.c"));
+        vendor_hash_build.file(llama_src.join("vendor/hash/xxhash/xxhash.c"));
+        vendor_hash_build.compile("vendor_hash");
         mtmd_build.compile("mtmd");
     }
 
