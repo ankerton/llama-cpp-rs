@@ -37,7 +37,10 @@ jobs:
       - name: Test
         run: cargo test --features sampler,mtmd,llguidance
       - name: Dry-Run Publishing
-        run: RUST_BACKTRACE=1 cargo publish --workspace --verbose --dry-run
+        # --allow-dirty: build.rs applies the ANKERTON_PATCH grammar overlay INTO the
+        # vendored llama.cpp/src/llama-grammar.cpp at build time, which the dry-run
+        # otherwise reports as an uncommitted change. This fork never publishes.
+        run: RUST_BACKTRACE=1 cargo publish --workspace --verbose --dry-run --allow-dirty
   arm64:
     name: Check that it builds on various targets
     runs-on: ubuntu-latest
