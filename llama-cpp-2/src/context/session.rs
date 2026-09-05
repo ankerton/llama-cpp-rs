@@ -3,6 +3,7 @@
 use crate::context::LlamaContext;
 use crate::token::LlamaToken;
 use std::ffi::{CString, NulError};
+use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 
 /// Flags for state sequence operations.
@@ -19,6 +20,12 @@ impl LlamaStateSeqFlags {
     /// without affecting the KV cache.
     pub const PARTIAL_ONLY: LlamaStateSeqFlags = LlamaStateSeqFlags(1);
 
+    /// Keep the copied data on device (GPU) memory rather than host.
+    ///
+    /// Getting the state for a `seq_id` with this flag invalidates all
+    /// prior states obtained for that `seq_id` with this flag set.
+    pub const ON_DEVICE: LlamaStateSeqFlags = LlamaStateSeqFlags(2);
+
     /// Create an empty flags set.
     pub const fn empty() -> LlamaStateSeqFlags {
         LlamaStateSeqFlags(0)
@@ -27,6 +34,11 @@ impl LlamaStateSeqFlags {
     /// Get the raw flags value.
     pub const fn bits(&self) -> u32 {
         self.0
+    }
+
+    /// Construct from raw bits.
+    pub const fn from_bits(bits: u32) -> LlamaStateSeqFlags {
+        LlamaStateSeqFlags(bits)
     }
 
     /// Check if a flag is set.
@@ -38,6 +50,13 @@ impl LlamaStateSeqFlags {
 impl Default for LlamaStateSeqFlags {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+impl std::ops::BitOr for LlamaStateSeqFlags {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -473,32 +492,41 @@ impl LlamaContext<'_> {
 
     /// Copy the state of a single sequence into the specified buffer with optional flags.
     ///
-    /// This is the extended version that supports flags for partial state operations.
+    /// This is the extended version that supports flags for partial state
+    /// operations. The C-side function is told the buffer's actual length
+    /// (via `dest.len()`), so writes are bounded — passing a buffer smaller
+    /// than the actual state size will cause the function to return less
+    /// than the full state, rather than overrun.
     ///
     /// # Parameters
     ///
-    /// * `dest` - Destination buffer to copy state into.
+    /// * `dest` - Destination buffer to copy state into. `dest.len()` is
+    ///   passed to the C function as the maximum write bound.
     /// * `seq_id` - The sequence ID to get the state for.
     /// * `flags` - Optional flags (e.g., [`LlamaStateSeqFlags::PARTIAL_ONLY`]).
     ///
-    /// # Safety
-    ///
-    /// Destination needs to have allocated enough memory.
-    ///
     /// # Returns
     ///
-    /// The number of bytes copied.
-    pub unsafe fn state_seq_get_data_ext(
+    /// The number of bytes actually copied. Always `<= dest.len()`.
+    ///
+    /// # Sizing
+    ///
+    /// Use [`Self::state_seq_get_size_ext`] to query the required size
+    /// before allocating. Pass a buffer of at least that size; the returned
+    /// byte count tells you how much was actually written.
+    pub fn state_seq_get_data_ext(
         &self,
-        dest: *mut u8,
+        dest: &mut [u8],
         seq_id: i32,
         flags: LlamaStateSeqFlags,
     ) -> usize {
+        // SAFETY: dest.as_mut_ptr() is valid for dest.len() bytes; the C
+        // function is bounded by the length argument we pass.
         unsafe {
             llama_cpp_sys_2::llama_state_seq_get_data_ext(
                 self.context.as_ptr(),
-                dest,
-                usize::MAX,
+                dest.as_mut_ptr(),
+                dest.len(),
                 seq_id,
                 flags.0,
             )
@@ -538,5 +566,131 @@ impl LlamaContext<'_> {
                 flags.0,
             ) > 0
         }
+    }
+
+    /// Serialize sequence `seq_id`'s state into an opaque [`SeqState`].
+    ///
+    /// Enables save/restore of context state at arbitrary points in a
+    /// sequence. This is particularly useful on architectures where
+    /// `clear_kv_cache_seq` cannot roll back partial state (Mamba, RWKV,
+    /// Gated Delta Networks, and other recurrent / hybrid-recurrent
+    /// models): pair with [`LlamaStateSeqFlags::PARTIAL_ONLY`] to save
+    /// just the running recurrent and SWA state, then restore it via
+    /// [`Self::state_seq_set`] to effectively "rewind" the sequence.
+    ///
+    /// The returned [`SeqState`] is opaque — its bytes cannot be
+    /// inspected or forged from safe code, so [`Self::state_seq_set`]
+    /// only ever sees data produced by this method.
+    ///
+    /// Wraps `llama_state_seq_get_data_ext`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateSeqError::SizeMismatch`] if llama.cpp writes a
+    /// different number of bytes than the reported state size.
+    pub fn state_seq_get(
+        &self,
+        seq_id: i32,
+        flags: LlamaStateSeqFlags,
+    ) -> Result<SeqState, crate::StateSeqError> {
+        let size = unsafe {
+            llama_cpp_sys_2::llama_state_seq_get_size_ext(self.context.as_ptr(), seq_id, flags.0)
+        };
+        let mut bytes = vec![0u8; size];
+        let n = unsafe {
+            llama_cpp_sys_2::llama_state_seq_get_data_ext(
+                self.context.as_ptr(),
+                bytes.as_mut_ptr(),
+                size,
+                seq_id,
+                flags.0,
+            )
+        };
+        if n != size {
+            return Err(crate::StateSeqError::SizeMismatch {
+                expected: size,
+                actual: n,
+            });
+        }
+        Ok(SeqState { bytes, flags })
+    }
+
+    /// Restore sequence state previously captured by [`Self::state_seq_get`]
+    /// into `seq_id`.
+    ///
+    /// Cross-sequence restore (`seq_id` different from the sequence the
+    /// state was captured from) is supported — llama.cpp treats the
+    /// destination sequence id independently of the source.
+    ///
+    /// Wraps `llama_state_seq_set_data_ext`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateSeqError::SizeMismatch`] if llama.cpp reads a
+    /// different number of bytes than the state buffer contains — this
+    /// covers shape mismatches (different `n_ctx`, `n_layer`, quantization,
+    /// etc.) that llama.cpp's own deserializer detects and aborts on.
+    pub fn state_seq_set(
+        &mut self,
+        state: &SeqState,
+        seq_id: i32,
+    ) -> Result<(), crate::StateSeqError> {
+        let n = unsafe {
+            llama_cpp_sys_2::llama_state_seq_set_data_ext(
+                self.context.as_ptr(),
+                state.bytes.as_ptr(),
+                state.bytes.len(),
+                seq_id,
+                state.flags.0,
+            )
+        };
+        if n != state.bytes.len() {
+            return Err(crate::StateSeqError::SizeMismatch {
+                expected: state.bytes.len(),
+                actual: n,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Opaque, immutable snapshot of a single sequence's state.
+///
+/// Produced by [`LlamaContext::state_seq_get`] and consumed by
+/// [`LlamaContext::state_seq_set`]. Bytes cannot be constructed, forged,
+/// or mutated from safe code — the only way to obtain a `SeqState` is
+/// via a get call, which guarantees the payload came from llama.cpp
+/// itself. Combined with llama.cpp's own shape validation on the
+/// deserialize path, this closes the "arbitrary bytes into C parser"
+/// unsoundness that motivates the unsafe raw setters.
+///
+/// The state carries the flag set it was captured with; restore uses
+/// those same flags automatically so the byte layout always matches.
+#[derive(Clone)]
+pub struct SeqState {
+    bytes: Vec<u8>,
+    flags: LlamaStateSeqFlags,
+}
+
+impl SeqState {
+    /// The flag set that was used to capture this state.
+    #[must_use]
+    pub fn flags(&self) -> LlamaStateSeqFlags {
+        self.flags
+    }
+
+    /// Size in bytes of the serialized state.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl Debug for SeqState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeqState")
+            .field("byte_len", &self.bytes.len())
+            .field("flags", &self.flags)
+            .finish()
     }
 }
